@@ -1,0 +1,711 @@
+diff --git a/src/base/Category.cc b/src/base/Category.cc
+new file mode 100644
+index 000000000..431e4ac2c
+--- /dev/null
++++ b/src/base/Category.cc
+@@ -0,0 +1,105 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++#include "base/Category.h"
++
++#include "base/Path.h"
++#include "base/Text.h"
++
++#include <algorithm>
++#include <cctype>
++#include <utility>
++
++namespace aria2 {
++namespace {
++
++bool endsWithIgnoringCase(std::string_view text, std::string_view suffix)
++{
++  if (suffix.empty() || suffix.size() > text.size()) {
++    return false;
++  }
++  const auto offset = text.size() - suffix.size();
++  return std::equal(suffix.begin(), suffix.end(), text.begin() + offset,
++                    [](char a, char b) {
++                      return std::tolower(static_cast<unsigned char>(a)) ==
++                             std::tolower(static_cast<unsigned char>(b));
++                    });
++}
++
++// A category stays below --dir: "..", a drive or a root would save the file
++// somewhere else entirely.
++bool usableDirectory(std::string_view directory)
++{
++  return !directory.empty() && directory != "." &&
++         isContainedRelativePath(directory);
++}
++
++void parseRules(std::string_view value, std::vector<CategoryRule>& rules)
++{
++  for (const auto& entry : text::split(value, ';')) {
++    const std::string_view rule(entry);
++    const auto colon = rule.find(':');
++    if (colon == std::string_view::npos) {
++      continue;
++    }
++    std::string directory(text::trim(rule.substr(0, colon)));
++    while (!directory.empty() && directory.back() == '/') {
++      directory.pop_back();
++    }
++    if (!usableDirectory(directory)) {
++      continue;
++    }
++    CategoryRule parsed{.directory = std::move(directory)};
++    for (const auto& suffix : text::split(rule.substr(colon + 1), ',')) {
++      auto trimmed = std::string(text::trim(suffix));
++      if (!trimmed.empty()) {
++        parsed.suffixes.push_back(std::move(trimmed));
++      }
++    }
++    if (!parsed.suffixes.empty()) {
++      rules.push_back(std::move(parsed));
++    }
++  }
++}
++
++} // namespace
++
++std::vector<CategoryRule> parseCategoryDirs(std::string_view spec)
++{
++  std::vector<CategoryRule> rules;
++  for (const auto& line : text::split(spec, '\n')) {
++    parseRules(line, rules);
++  }
++  return rules;
++}
++
++std::string categoryDirectory(std::string_view dir, std::string_view name,
++                              std::string_view spec)
++{
++  if (spec.empty() || name.empty()) {
++    return std::string(dir);
++  }
++  const auto path = toPath(name);
++  if (path.is_absolute() || path.has_root_name()) {
++    return std::string(dir);
++  }
++  // A rule matches the file name, not the subdirectory --out may name.
++  const auto file = toUtf8(path.filename());
++  for (const auto& rule : parseCategoryDirs(spec)) {
++    const auto matches =
++        std::any_of(rule.suffixes.begin(), rule.suffixes.end(),
++                    [&file](const std::string& suffix) {
++                      return endsWithIgnoringCase(file, suffix);
++                    });
++    if (!matches) {
++      continue;
++    }
++    // --out may already name the category, as in "archive/film.zip".
++    if (text::istartsWith(name, rule.directory + "/") ||
++        text::istartsWith(name, rule.directory + "\\")) {
++      return std::string(dir);
++    }
++    return joinPath(dir, rule.directory);
++  }
++  return std::string(dir);
++}
++
++} // namespace aria2
+diff --git a/src/base/Category.h b/src/base/Category.h
+new file mode 100644
+index 000000000..e8dfa8a62
+--- /dev/null
++++ b/src/base/Category.h
+@@ -0,0 +1,35 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace aria2 {
++
++// One --category-dir rule: a download whose file name ends with one of
++// `suffixes` is saved in `directory`, a relative path below --dir.
++struct CategoryRule {
++  std::string directory;
++  std::vector<std::string> suffixes;
++};
++
++// Bits of --category-dir-scope, selecting which names a rule may move.
++inline constexpr unsigned CategoryScopeAutomatic = 1; // from the URI or server
++inline constexpr unsigned CategoryScopeOut = 2;       // given with --out
++
++// Parses --category-dir. A value holds rules separated by ';', each written
++// as "DIRECTORY:.SUFFIX,.SUFFIX"; repeated values and line breaks in a
++// configuration file are equally accepted. Spaces around a directory and a
++// suffix are ignored and suffixes match without regard to case. A rule with
++// no suffix, or whose directory is absolute or leaves --dir, is dropped.
++std::vector<CategoryRule> parseCategoryDirs(std::string_view spec);
++
++// The directory a download named `name` belongs in: `dir` itself, or dir/DIR
++// for the first matching rule. A `name` that is absolute leaves the choice to
++// the caller, and one that already starts with its category keeps `dir`, so
++// joining `name` again does not nest the file twice.
++std::string categoryDirectory(std::string_view dir, std::string_view name,
++                              std::string_view spec);
++
++} // namespace aria2
+diff --git a/src/core/Task.cc b/src/core/Task.cc
+index e72e5b9b8..ce5f1c03f 100644
+--- a/src/core/Task.cc
++++ b/src/core/Task.cc
+@@ -1,6 +1,7 @@
+ /* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
+ #include "core/Task.h"
+ 
++#include "base/Category.h"
+ #include "core/Engine.h"
+ 
+ #include <boost/json/array.hpp>
+@@ -63,6 +64,18 @@ std::optional<Task::Moves> Task::relocation(const std::string&) const
+ 
+ void Task::relocated(const std::string& dir) { options().set("dir", dir); }
+ 
++std::string Task::outputDirectory(std::string_view name,
++                                  bool explicitName) const
++{
++  const auto dir = options_->get("dir");
++  const auto bit = explicitName ? CategoryScopeOut : CategoryScopeAutomatic;
++  if ((static_cast<unsigned>(options_->integer("category-dir-scope")) & bit) ==
++      0) {
++    return dir;
++  }
++  return categoryDirectory(dir, name, options_->get("category-dir"));
++}
++
+ bool Task::changeUris(int, const std::vector<std::string>&,
+                       const std::vector<std::string>&, int)
+ {
+diff --git a/src/core/Task.h b/src/core/Task.h
+index 7b7332d39..30765663c 100644
+--- a/src/core/Task.h
++++ b/src/core/Task.h
+@@ -116,6 +116,12 @@ protected:
+   void failed(ErrorCode code, std::string message);
+   Engine& engine() const { return engine_; }
+ 
++  // --dir, or the category of --category-dir that a download named `name`
++  // belongs to. `explicitName` marks a name the caller chose (--out) instead
++  // of one the URI or the server supplied; --category-dir-scope selects which
++  // of the two kinds is moved.
++  std::string outputDirectory(std::string_view name, bool explicitName) const;
++
+ private:
+   friend class Engine;
+ 
+diff --git a/src/ed2k/Ed2kTask.cc b/src/ed2k/Ed2kTask.cc
+index d75fb3ed4..e46fda54e 100644
+--- a/src/ed2k/Ed2kTask.cc
++++ b/src/ed2k/Ed2kTask.cc
+@@ -93,13 +93,14 @@ Ed2kTask::~Ed2kTask() = default;
+ std::string Ed2kTask::defaultPath() const
+ {
+   auto name = options().get("out");
++  const auto explicitName = !name.empty();
+   if (name.empty()) {
+     name = safeFileName(link_.name);
+   }
+   if (name.empty()) {
+     name = text::toHex(link_.hash);
+   }
+-  return joinPath(options().get("dir"), name);
++  return joinPath(outputDirectory(name, explicitName), name);
+ }
+ 
+ // --- lifecycle --------------------------------------------------------------
+diff --git a/src/http/HttpTask.cc b/src/http/HttpTask.cc
+index f8cea6e9a..a2c9f8395 100644
+--- a/src/http/HttpTask.cc
++++ b/src/http/HttpTask.cc
+@@ -991,6 +991,9 @@ HttpTask::validators(const Source& source) const
+ bool HttpTask::decidePath(Worker& worker)
+ {
+   auto name = options().get("out");
++  // Only --out lets the caller choose the name; the rest comes from the URI
++  // or the server, and --category-dir-scope tells the two apart.
++  const auto explicitName = !name.empty();
+   if (name.empty()) {
+     const auto hint = safeFileName(options().get("filename-hint"));
+     const auto disposition =
+@@ -1023,7 +1026,7 @@ bool HttpTask::decidePath(Worker& worker)
+       name = "index.html";
+     }
+   }
+-  auto path = joinPath(options().get("dir"), name);
++  auto path = joinPath(outputDirectory(name, explicitName), name);
+   const auto suffix = options().get("incomplete-suffix");
+   // A leftover unfinished file holds the name like a finished one.
+   const auto leftover = [&suffix](const std::string& candidate) {
+@@ -2045,8 +2048,10 @@ int HttpTask::connections() const
+ std::vector<TaskFile> HttpTask::files() const
+ {
+   TaskFile file;
++  // A task that has not opened its file yet still reports where it will go.
+   file.path = path_.empty() && !options().blank("out")
+-                  ? joinPath(options().get("dir"), options().get("out"))
++                  ? joinPath(outputDirectory(options().get("out"), true),
++                             options().get("out"))
+                   : path_;
+   file.length = totalLength();
+   file.completed = completedLength();
+diff --git a/src/http/NoProxy.cc b/src/http/NoProxy.cc
+new file mode 100644
+index 000000000..0f4abd22b
+--- /dev/null
++++ b/src/http/NoProxy.cc
+@@ -0,0 +1,105 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++// Which hosts reach the network directly while a proxy is configured:
++// --no-proxy and --no-proxy-list.
++#include "http/NoProxy.h"
++
++#include "base/Text.h"
++
++#include <algorithm>
++#include <regex>
++#include <utility>
++
++namespace aria2::http {
++namespace {
++
++// libcurl matches a bare domain against the host and every name below it, but
++// reads a *.glob literally, so a glob is resolved here.
++std::string globPattern(std::string_view glob)
++{
++  std::string pattern;
++  for (const char c : glob) {
++    if (c == '*') {
++      pattern += ".*";
++      continue;
++    }
++    if (std::string_view(".^$|()[]{}+?\\").find(c) != std::string_view::npos) {
++      pattern += '\\';
++    }
++    pattern += c;
++  }
++  return pattern;
++}
++
++void append(std::vector<std::string>& rules, std::string rule)
++{
++  if (rule.empty() ||
++      std::find(rules.begin(), rules.end(), rule) != rules.end()) {
++    return;
++  }
++  rules.push_back(std::move(rule));
++}
++
++} // namespace
++
++std::string normalizeNoProxyDomain(std::string_view entry)
++{
++  auto domain = text::lower(text::trim(entry));
++  for (const std::string_view wildcard : {"*.", "."}) {
++    if (domain.starts_with(wildcard)) {
++      domain.erase(0, wildcard.size());
++      break;
++    }
++  }
++  while (domain.ends_with('.')) {
++    domain.pop_back();
++  }
++  // A path, a URL or a glob anywhere but the front names no host.
++  if (domain.empty() || domain == "." || domain == ".." ||
++      domain.find_first_of("/* \t") != std::string::npos) {
++    return {};
++  }
++  return domain;
++}
++
++std::vector<std::string> parseNoProxyList(std::string_view spec)
++{
++  std::vector<std::string> domains;
++  const auto separated = text::replaceAll(
++      text::replaceAll(std::string(spec), ";", ","), "\n", ",");
++  for (const auto& entry : text::split(separated, ',')) {
++    append(domains, normalizeNoProxyDomain(entry));
++  }
++  return domains;
++}
++
++std::string noProxyRules(std::string_view noProxy, std::string_view list,
++                         std::string_view host)
++{
++  std::vector<std::string> rules;
++  const auto separated =
++      text::replaceAll(std::string(noProxy), ";", ",");
++  for (const auto& entry : text::split(separated, ',')) {
++    const auto rule = text::trim(entry);
++    if (rule == "*") {
++      // No host uses the proxy, so no further rule can change the answer.
++      return "*";
++    }
++    if (rule.find('*') == std::string_view::npos) {
++      append(rules, std::string(rule));
++      continue;
++    }
++    // A glob in --no-proxy has always named this request's host or nothing.
++    if (host.empty() || !std::regex_match(std::string(host),
++                                          std::regex(globPattern(rule),
++                                                     std::regex::icase))) {
++      continue;
++    }
++    append(rules, std::string(host));
++  }
++  for (auto& domain : parseNoProxyList(list)) {
++    append(rules, std::move(domain));
++  }
++  return text::join(rules, ",");
++}
++
++} // namespace aria2::http
+diff --git a/src/http/NoProxy.h b/src/http/NoProxy.h
+new file mode 100644
+index 000000000..813b5f537
+--- /dev/null
++++ b/src/http/NoProxy.h
+@@ -0,0 +1,28 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace aria2::http {
++
++// One --no-proxy-list entry in the form libcurl matches it: lower case and
++// without a leading "." or "*." wildcard, which already means the domain and
++// everything below it. Empty when the entry cannot name a host.
++std::string normalizeNoProxyDomain(std::string_view entry);
++
++// The domains of a --no-proxy-list value, separated by commas, semicolons or
++// line breaks, in the order given and without repeats. An entry that cannot
++// name a host (empty, a URL, a glob that is not a *.domain prefix) is dropped.
++std::vector<std::string> parseNoProxyList(std::string_view spec);
++
++// The value for CURLOPT_NOPROXY: --no-proxy followed by --no-proxy-list, so a
++// host named in either one reaches the network without the proxy. `*` in
++// --no-proxy keeps meaning "no host uses the proxy" and wins over everything
++// else. A *.glob in --no-proxy applies to `host` alone, as aria2 always did,
++// so it is replaced by `host` when it matches and dropped when it does not.
++std::string noProxyRules(std::string_view noProxy, std::string_view list,
++                         std::string_view host);
++
++} // namespace aria2::http
+diff --git a/src/http/Request.cc b/src/http/Request.cc
+index 48f01658f..e66054310 100644
+--- a/src/http/Request.cc
++++ b/src/http/Request.cc
+@@ -5,45 +5,14 @@
+ #include "base/Uri.h"
+ #include "http/Client.h"
+ #include "http/Cookies.h"
++#include "http/NoProxy.h"
+ #include "http/Request.h"
+ #include "http/SegmentPlanner.h"
+ #include "options/Options.h"
+ 
+-#include <regex>
+-
+ namespace aria2::http {
+ namespace {
+ 
+-// Expands host globs such as *.example.com for this request; libcurl keeps
+-// native domain, address and CIDR matching for the remaining rules.
+-std::string noProxyFor(const std::string& rules, const std::string& host)
+-{
+-  std::vector<std::string> result;
+-  for (auto rule : text::split(text::replaceAll(rules, ";", ","), ',')) {
+-    if (rule != "*" && rule.find('*') != std::string::npos) {
+-      std::string pattern;
+-      for (const char c : rule) {
+-        if (c == '*') {
+-          pattern += ".*";
+-          continue;
+-        }
+-        if (std::string_view(".^$|()[]{}+?\\").find(c) !=
+-            std::string_view::npos) {
+-          pattern += '\\';
+-        }
+-        pattern += c;
+-      }
+-      rule = std::regex_match(host, std::regex(pattern, std::regex::icase))
+-                 ? host
+-                 : "";
+-    }
+-    if (!rule.empty()) {
+-      result.push_back(rule);
+-    }
+-  }
+-  return text::join(result, ",");
+-}
+-
+ const char* proxyKind(const std::string& scheme)
+ {
+   return scheme == "https" ? "https" : scheme == "http" ? "http" : "all";
+@@ -186,8 +155,13 @@ void configureRequest(CURL* easy, CURLSH* share, std::string& loadedCookies,
+       set(CURLOPT_PROXYUSERNAME, options.get(prefix + "-user").c_str());
+       set(CURLOPT_PROXYPASSWORD, options.get(prefix + "-passwd").c_str());
+     }
+-    if (!options.blank("no-proxy") && parts) {
+-      const auto bypass = noProxyFor(options.get("no-proxy"), parts->host);
++    // A host on --no-proxy-list reaches the network directly, so a domain that
++    // is faster without the proxy can be named without disabling it.
++    const auto bypass = noProxyRules(options.get("no-proxy"),
++                                     options.get("no-proxy-list"),
++                                     parts ? std::string_view(parts->host)
++                                           : std::string_view());
++    if (!bypass.empty()) {
+       set(CURLOPT_NOPROXY, bypass.c_str());
+     }
+   }
+diff --git a/src/media/MediaTask.cc b/src/media/MediaTask.cc
+index 57115674b..cfd48b21f 100644
+--- a/src/media/MediaTask.cc
++++ b/src/media/MediaTask.cc
+@@ -127,8 +127,14 @@ std::string MediaTask::outputPath() const
+   if (!snapshot_.path.empty()) {
+     return snapshot_.path;
+   }
+-  return toUtf8(std::filesystem::absolute(
+-      toPath(joinPath(options().get("dir"), mediaName(options(), uri_)))));
++  return plannedPath();
++}
++
++std::string MediaTask::plannedPath() const
++{
++  const auto name = mediaName(options(), uri_);
++  const auto dir = outputDirectory(name, !options().blank("out"));
++  return toUtf8(std::filesystem::absolute(toPath(joinPath(dir, name))));
+ }
+ 
+ int64_t MediaTask::downloadLimit() const
+@@ -165,8 +171,7 @@ void MediaTask::start()
+            "A source checksum cannot validate a remuxed presentation; "
+            "use media=file to download the source unchanged");
+     }
+-    auto path = toUtf8(std::filesystem::absolute(
+-        toPath(joinPath(options().get("dir"), mediaName(options(), uri_)))));
++    auto path = plannedPath();
+     if (fileExists(path) && !options().flag("allow-overwrite")) {
+       // A pending publication of this task may already have placed it.
+       Store store(directory_, gidText(gid()));
+diff --git a/src/media/MediaTask.h b/src/media/MediaTask.h
+index 354ddcec6..56f193a9d 100644
+--- a/src/media/MediaTask.h
++++ b/src/media/MediaTask.h
+@@ -48,6 +48,9 @@ public:
+ private:
+   void restore();
+   std::string outputPath() const;
++  // Where the remuxed file goes before the task has run: --dir with
++  // --category-dir applied to the name mediaName() derives.
++  std::string plannedPath() const;
+   int64_t downloadLimit() const;
+   void schedulePoll();
+   void poll();
+diff --git a/src/options/Catalog.cc b/src/options/Catalog.cc
+index 126f4708d..ac2ba0477 100644
+--- a/src/options/Catalog.cc
++++ b/src/options/Catalog.cc
+@@ -66,6 +66,7 @@ constexpr std::array catalog{
+   OptionSpec{"https-proxy-user", 0, Text, "", TG | Secret, "http", "User for --https-proxy."},
+   OptionSpec{"https-proxy-passwd", 0, Text, "", TG | Secret, "http", "Password for --https-proxy."},
+   OptionSpec{"no-proxy", 0, Text, "", TG, "http", "Comma-separated hosts, domains, networks or *.globs that bypass the proxy."},
++  OptionSpec{"no-proxy-list", 0, List, "", TG, "http", "Domains fetched directly even when a proxy is set, on top of --no-proxy: nvidia.com, *.amd.com; repeatable."},
+   OptionSpec{"dns-over-https", 0, Text, "", TG, "http", "Resolve host names through this DNS-over-HTTPS URL."},
+   OptionSpec{"interface", 0, Text, "", TG, "http", "Bind connections to an interface, IP address or host name."},
+   OptionSpec{"disable-ipv6", 0, Flag, "false", TG, "http", "Do not use IPv6."},
+@@ -91,6 +92,8 @@ constexpr std::array catalog{
+   OptionSpec{"force-save", 0, Flag, "false", TLG, "file", "Save the task in the session even when it is finished."},
+   OptionSpec{"save-not-found", 0, Flag, "true", TLG, "file", "Save tasks that failed with 404 in the session."},
+   OptionSpec{"index-out", 'O', List, "", Task, "file", "INDEX=PATH output path for a torrent file; repeatable."},
++  OptionSpec{"category-dir", 0, List, "", TG, "file", "Save downloads into subdirectories of --dir by file name suffix: \"archive:.zip,.rar;text:.txt\"; repeatable."},
++  OptionSpec{"category-dir-scope", 0, Integer, "1", TG, "file", "Names --category-dir moves: 1 from the URI or server, 2 given with --out, 3 both.", 0, 3},
+ 
+   // BitTorrent
+   OptionSpec{"torrent-file", 'T', Path, "", 0, "bittorrent", "Torrent file to download."},
+diff --git a/tests/CategoryTest.cc b/tests/CategoryTest.cc
+new file mode 100644
+index 000000000..eb8f3fec0
+--- /dev/null
++++ b/tests/CategoryTest.cc
+@@ -0,0 +1,91 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++#include "base/Category.h"
++#include "base/Path.h"
++
++#include <doctest/doctest.h>
++
++using namespace aria2;
++
++TEST_CASE("category rules parse the zero syntax")
++{
++  const auto rules = parseCategoryDirs("archive:.zip,.rar;text:.txt,.md");
++  REQUIRE(rules.size() == 2);
++  CHECK(rules[0].directory == "archive");
++  CHECK(rules[0].suffixes == std::vector<std::string>{".zip", ".rar"});
++  CHECK(rules[1].directory == "text");
++  CHECK(rules[1].suffixes == std::vector<std::string>{".txt", ".md"});
++}
++
++TEST_CASE("category rules accept repeats and config file lines")
++{
++  // A repeated option arrives as one value per line, as does one entry per
++  // line in a configuration file.
++  const auto rules =
++      parseCategoryDirs("archive:.zip\n;text:.txt\n\nvideo:.mkv,.mp4;");
++  REQUIRE(rules.size() == 3);
++  CHECK(rules[0].directory == "archive");
++  CHECK(rules[1].directory == "text");
++  CHECK(rules[2].suffixes == std::vector<std::string>{".mkv", ".mp4"});
++}
++
++TEST_CASE("category rules normalise spacing and trailing separators")
++{
++  const auto rules = parseCategoryDirs("  archive  : .zip , .rar ,  ");
++  REQUIRE(rules.size() == 1);
++  CHECK(rules[0].directory == "archive");
++  CHECK(rules[0].suffixes == std::vector<std::string>{".zip", ".rar"});
++
++  CHECK(parseCategoryDirs("archive:.zip").at(0).directory == "archive");
++  // A nested category keeps its separators.
++  CHECK(parseCategoryDirs("media/incoming:.mkv").at(0).directory ==
++        "media/incoming");
++}
++
++TEST_CASE("category rules drop unusable entries")
++{
++  // Nothing to match, nowhere safe to go.
++  CHECK(parseCategoryDirs("").empty());
++  CHECK(parseCategoryDirs("archive").empty());
++  CHECK(parseCategoryDirs("archive:").empty());
++  CHECK(parseCategoryDirs("archive:,,").empty());
++  CHECK(parseCategoryDirs("../escape:.zip").empty());
++  CHECK(parseCategoryDirs("a/../../escape:.zip").empty());
++  CHECK(parseCategoryDirs("/absolute:.zip").empty());
++  CHECK(parseCategoryDirs(".:.zip").empty());
++}
++
++TEST_CASE("category directory matches the file name suffix")
++{
++  const std::string spec = "archive:.zip,.rar;text:.txt";
++  const std::string dir = "downloads";
++  CHECK(categoryDirectory(dir, "film.zip", spec) == joinPath(dir, "archive"));
++  // The zero rules are the same, matched without regard to case.
++  CHECK(categoryDirectory(dir, "FILM.ZIP", spec) == joinPath(dir, "archive"));
++  CHECK(categoryDirectory(dir, "notes.txt", spec) == joinPath(dir, "text"));
++  // No rule matches: the download stays in --dir.
++  CHECK(categoryDirectory(dir, "film.zip", "") == dir);
++  CHECK(categoryDirectory(dir, "film.mkv", spec) == dir);
++  // A suffix matches the end of the name, not a part in the middle.
++  CHECK(categoryDirectory(dir, "zip.list", spec) == dir);
++  // --out may name a subdirectory; the rule still reads the file name.
++  CHECK(categoryDirectory(dir, toUtf8(toPath("series") / "first.zip"), spec) ==
++        joinPath(dir, "archive"));
++}
++
++TEST_CASE("category directory keeps a name that is already categorised")
++{
++  const std::string spec = "archive:.zip";
++  const std::string dir = "downloads";
++  // --out may name the category itself; deciding again must not nest the
++  // file in archive/archive.
++  CHECK(categoryDirectory(dir, joinPath("archive", "film.zip"), spec) == dir);
++  CHECK(categoryDirectory(dir, "archive/film.zip", spec) == dir);
++}
++
++TEST_CASE("category directory leaves absolute names alone")
++{
++  // --dir cannot move a file the caller placed absolutely.
++  const auto absolute = toUtf8(fs::absolute(toPath("film.zip")));
++  CHECK(categoryDirectory("downloads", absolute, "archive:.zip") ==
++        "downloads");
++}
+diff --git a/tests/NoProxyTest.cc b/tests/NoProxyTest.cc
+new file mode 100644
+index 000000000..4b3d9d6d4
+--- /dev/null
++++ b/tests/NoProxyTest.cc
+@@ -0,0 +1,75 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++#include "http/NoProxy.h"
++
++#include <doctest/doctest.h>
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++using namespace aria2;
++using namespace std::string_view_literals;
++
++TEST_CASE("no-proxy list entries become bare domains")
++{
++  const auto domains = http::parseNoProxyList("nvidia.com,*.AMD.com; .intel.cn ");
++  REQUIRE(domains.size() == 3);
++  CHECK(domains[0] == "nvidia.com");
++  // The *.domain form already means the domain and its subdomains.
++  CHECK(domains[1] == "amd.com");
++  CHECK(domains[2] == "intel.cn");
++  // Repeats and different separators name the same host once.
++  CHECK(http::parseNoProxyList("amd.com\nAMD.COM,amd.com"sv) ==
++        std::vector<std::string>{"amd.com"});
++  // A configuration file arrives as one value per line.
++  CHECK(http::parseNoProxyList("a.example\nb.example") ==
++        std::vector<std::string>{"a.example", "b.example"});
++}
++
++TEST_CASE("no-proxy list entries that name no host are dropped")
++{
++  CHECK(http::parseNoProxyList("").empty());
++  CHECK(http::parseNoProxyList(" , ; \n ").empty());
++  // A path, a URL and a glob that is not a *.domain prefix are not hosts.
++  CHECK(http::parseNoProxyList("https://example.com/file").empty());
++  CHECK(http::parseNoProxyList("example.com/download").empty());
++  CHECK(http::parseNoProxyList("exa*mple.com").empty());
++  CHECK(http::parseNoProxyList("*").empty());
++}
++
++TEST_CASE("no-proxy list adds to --no-proxy in the order given")
++{
++  CHECK(http::noProxyRules("localhost, 10.0.0.0/8", "nvidia.com,amd.com",
++                           "cdn.example.com") ==
++        "localhost,10.0.0.0/8,nvidia.com,amd.com");
++  // A host named twice is bypassed once.
++  CHECK(http::noProxyRules("nvidia.com", "NVIDIA.com,amd.com",
++                           "cdn.example.com") == "nvidia.com,amd.com");
++}
++
++TEST_CASE("an empty no-proxy list leaves --no-proxy alone")
++{
++  // The list is empty by default, so a configuration without it keeps the
++  // rules it always had, and no rules still means no bypass.
++  CHECK(http::noProxyRules("localhost", "", "example.com") == "localhost");
++  CHECK(http::noProxyRules("", "", "example.com").empty());
++}
++
++TEST_CASE("no-proxy * keeps meaning that no host uses the proxy")
++{
++  CHECK(http::noProxyRules("*", "nvidia.com", "example.com") == "*");
++  CHECK(http::noProxyRules("localhost;*", "", "example.com") == "*");
++}
++
++TEST_CASE("no-proxy globs apply to the request host only")
++{
++  const auto matching =
++      http::noProxyRules("*.corp.example", "", "a.corp.example");
++  CHECK(matching == "a.corp.example");
++  // libcurl would read the glob literally and never match, so it is dropped.
++  const auto other =
++      http::noProxyRules("*.corp.example", "", "corp.example.net");
++  CHECK(other.empty());
++  // An empty host cannot satisfy a glob.
++  CHECK(http::noProxyRules("*.corp.example", "", "").empty());
++}
