@@ -1,0 +1,79 @@
+name: Check aria2-next Update
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aria2-next-check-update
+  cancel-in-progress: false
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Check latest upstream Release
+        id: check
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com/repos/AnInsomniacy/aria2-next/releases/latest"
+
+          RELEASE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "$API")
+
+          TAG=$(jq -er '.tag_name' <<< "$RELEASE")
+          UPDATED_AT=$(jq -er '.updated_at' <<< "$RELEASE")
+
+          if [ -z "$TAG" ] || [ -z "$UPDATED_AT" ]; then
+            echo "无法获取上游 Release 信息"
+            exit 1
+          fi
+
+          FILE="aria2-next/更新时间.txt"
+          mkdir -p aria2-next
+          touch "$FILE"
+
+          OLD_TIME=$(cat "$FILE" | tr -d '\r\n')
+
+          echo "上游标签：$TAG"
+          echo "上游更新时间：$UPDATED_AT"
+          echo "本地更新时间：$OLD_TIME"
+
+          if [ "$UPDATED_AT" = "$OLD_TIME" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Release 没有更新"
+            exit 0
+          fi
+
+          printf '%s\n' "$UPDATED_AT" > "$FILE"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated timestamp
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add aria2-next/更新时间.txt
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git commit -m "Update aria2-next release timestamp"
+          git push
