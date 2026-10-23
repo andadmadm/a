@@ -16,7 +16,7 @@ concurrency:
 jobs:
   resolve-upstream:
     name: Resolve upstream release
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04 
     outputs:
       tag: ${{ steps.upstream.outputs.tag }}
       version: ${{ steps.upstream.outputs.version }}
