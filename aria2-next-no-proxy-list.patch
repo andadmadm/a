@@ -1,0 +1,369 @@
+From 5a0e8bdc63da73783cadca86b076cee2eda7218f Mon Sep 17 00:00:00 2001
+From: root <root@localhost>
+Date: Fri, 23 Oct 2026 18:12:55 +0800
+Subject: [PATCH] feat(http): add --no-proxy-list
+
+A proxy is there to reach hosts that are otherwise unreachable, but some
+domains are better fetched directly: Windows Update, driver downloads and
+game content come from large, nearby CDNs, and a proxy adds a hop that can
+cost the whole speed of the transfer.
+
+"--no-proxy-list" names those domains. It works on top of --no-proxy, so a
+configuration that already bypasses a few hosts can add download domains
+without touching it; an entry may be "vendor.com" or "*.vendor.com" and
+matches the domain and every name below it. A value may repeat, and several
+entries may be separated by commas, semicolons or line breaks, as --no-proxy
+already allows.
+
+The list is empty by default, so nothing changes for a configuration that
+does not use it: --no-proxy keeps the rules it had, and no rules still mean
+no bypass. http::noProxyRules() assembles the value CURLOPT_NOPROXY receives
+and keeps the meaning --no-proxy always had: "*" still disables the proxy for
+every host, and a *.glob still names the host of one request rather than
+becoming a pattern libcurl would read literally.
+---
+ docs/completion/aria2-next |   2 +-
+ docs/options.md            |   1 +
+ src/http/NoProxy.cc        | 105 +++++++++++++++++++++++++++++++++++++
+ src/http/NoProxy.h         |  28 ++++++++++
+ src/http/Request.cc        |  42 +++------------
+ src/options/Catalog.cc     |   1 +
+ tests/NoProxyTest.cc       |  75 ++++++++++++++++++++++++++
+ 7 files changed, 219 insertions(+), 35 deletions(-)
+ create mode 100644 src/http/NoProxy.cc
+ create mode 100644 src/http/NoProxy.h
+ create mode 100644 tests/NoProxyTest.cc
+
+diff --git a/docs/completion/aria2-next b/docs/completion/aria2-next
+index b522f6097..30da00f5c 100644
+--- a/docs/completion/aria2-next
++++ b/docs/completion/aria2-next
+@@ -82,7 +82,7 @@ _aria2_next()
+     esac
+     case $cur in
+         -*)
+-            COMPREPLY=( $( compgen -W '--dir --out --input-file --max-concurrent-downloads --continue --check-integrity --log --quiet --daemon --conf-path --no-conf --version --help --split --max-connection-per-server --min-split-size --timeout --connect-timeout --max-tries --retry-wait --lowest-speed-limit --max-download-limit --max-overall-download-limit --user-agent --referer --header --http-user --http-passwd --http-no-cache --http-accept-gzip --enable-http-keep-alive --load-cookies --save-cookies --check-certificate --ca-certificate --certificate --private-key --min-tls-version --all-proxy --all-proxy-user --all-proxy-passwd --http-proxy --http-proxy-user --http-proxy-passwd --https-proxy --https-proxy-user --https-proxy-passwd --no-proxy --dns-over-https --interface --disable-ipv6 --netrc-path --no-netrc --sftp-user --sftp-passwd --ssh-host-key-sha256 --remote-time --checksum --max-file-not-found --filename-hint --filename-hint-source --dry-run --allow-overwrite --auto-file-renaming --incomplete-suffix --auto-file-renaming-style --file-allocation --remove-control-file --force-save --save-not-found --index-out --category-dir --category-dir-scope --torrent-file --follow-torrent --select-file --show-files --pause-metadata --listen-port --enable-dht --enable-peer-exchange --bt-enable-lpd --bt-port-mapping --bt-encryption --bt-transport --bt-tracker --bt-exclude-tracker --bt-max-peers --bt-max-connections --bt-max-uploads --bt-max-uploads-per-torrent --max-upload-limit --max-overall-upload-limit --seed-ratio --seed-time --bt-seed-unverified --bt-super-seeding --bt-first-last-piece-first --bt-file-priority --force-sequential --hash-check-only --detach-share-only --bt-external-ip --bt-external-port --bt-interface --bt-proxy --bt-anonymous-mode --bt-user-agent --bt-peer-id-prefix --bt-peer-blocklist --bt-blocklist-scope --bt-rate-limit-overhead --bt-dht-bootstrap-nodes --metalink-file --follow-metalink --ed2k-server --ed2k-server-list --ed2k-node-list --ed2k-listen-port --ed2k-udp-listen-port --ed2k-port-mapping --ed2k-upload-slots --ed2k-max-connections --ed2k-preview-priority --media --media-format --media-video --media-audio --media-subtitles --media-pause-after-probe --media-record-time --media-start-time --media-end-time --media-request-contexts --media-input --enable-rpc --rpc-listen-port --rpc-listen-all --rpc-allow-origin-all --rpc-secret --rpc-max-request-size --rpc-save-upload-metadata --pause --gid --state-dir --save-session --save-session-interval --state-save-interval --max-download-result --keep-unfinished-download-result --stop --stop-with-process --summary-interval --show-console-readout --enable-color --download-result --log-level --console-log-level --log-max-size --log-max-files --on-download-start --on-download-pause --on-download-stop --on-download-complete --on-download-error --on-bt-download-complete ' -- "$cur" ) )
++            COMPREPLY=( $( compgen -W '--dir --out --input-file --max-concurrent-downloads --continue --check-integrity --log --quiet --daemon --conf-path --no-conf --version --help --split --max-connection-per-server --min-split-size --timeout --connect-timeout --max-tries --retry-wait --lowest-speed-limit --max-download-limit --max-overall-download-limit --user-agent --referer --header --http-user --http-passwd --http-no-cache --http-accept-gzip --enable-http-keep-alive --load-cookies --save-cookies --check-certificate --ca-certificate --certificate --private-key --min-tls-version --all-proxy --all-proxy-user --all-proxy-passwd --http-proxy --http-proxy-user --http-proxy-passwd --https-proxy --https-proxy-user --https-proxy-passwd --no-proxy --no-proxy-list --dns-over-https --interface --disable-ipv6 --netrc-path --no-netrc --sftp-user --sftp-passwd --ssh-host-key-sha256 --remote-time --checksum --max-file-not-found --filename-hint --filename-hint-source --dry-run --allow-overwrite --auto-file-renaming --incomplete-suffix --auto-file-renaming-style --file-allocation --remove-control-file --force-save --save-not-found --index-out --category-dir --category-dir-scope --torrent-file --follow-torrent --select-file --show-files --pause-metadata --listen-port --enable-dht --enable-peer-exchange --bt-enable-lpd --bt-port-mapping --bt-encryption --bt-transport --bt-tracker --bt-exclude-tracker --bt-max-peers --bt-max-connections --bt-max-uploads --bt-max-uploads-per-torrent --max-upload-limit --max-overall-upload-limit --seed-ratio --seed-time --bt-seed-unverified --bt-super-seeding --bt-first-last-piece-first --bt-file-priority --force-sequential --hash-check-only --detach-share-only --bt-external-ip --bt-external-port --bt-interface --bt-proxy --bt-anonymous-mode --bt-user-agent --bt-peer-id-prefix --bt-peer-blocklist --bt-blocklist-scope --bt-rate-limit-overhead --bt-dht-bootstrap-nodes --metalink-file --follow-metalink --ed2k-server --ed2k-server-list --ed2k-node-list --ed2k-listen-port --ed2k-udp-listen-port --ed2k-port-mapping --ed2k-upload-slots --ed2k-max-connections --ed2k-preview-priority --media --media-format --media-video --media-audio --media-subtitles --media-pause-after-probe --media-record-time --media-start-time --media-end-time --media-request-contexts --media-input --enable-rpc --rpc-listen-port --rpc-listen-all --rpc-allow-origin-all --rpc-secret --rpc-max-request-size --rpc-save-upload-metadata --pause --gid --state-dir --save-session --save-session-interval --state-save-interval --max-download-result --keep-unfinished-download-result --stop --stop-with-process --summary-interval --show-console-readout --enable-color --download-result --log-level --console-log-level --log-max-size --log-max-files --on-download-start --on-download-pause --on-download-stop --on-download-complete --on-download-error --on-bt-download-complete ' -- "$cur" ) )
+             ;;
+         *)
+             _filedir '@(torrent|meta4|metalink|text|txt|list|lst)'
+diff --git a/docs/options.md b/docs/options.md
+index f8c33f434..5bcd2320e 100644
+--- a/docs/options.md
++++ b/docs/options.md
+@@ -65,6 +65,7 @@ through RPC (`aria2.addUri` options, `aria2.changeOption`,
+ | `--https-proxy-user` | VALUE |  | User for --https-proxy. |
+ | `--https-proxy-passwd` | VALUE |  | Password for --https-proxy. |
+ | `--no-proxy` | VALUE |  | Comma-separated hosts, domains, networks or *.globs that bypass the proxy. |
++| `--no-proxy-list` | VALUE |  | Domains fetched directly even when a proxy is set, on top of --no-proxy: nvidia.com, *.amd.com; repeatable. |
+ | `--dns-over-https` | VALUE |  | Resolve host names through this DNS-over-HTTPS URL. |
+ | `--interface` | VALUE |  | Bind connections to an interface, IP address or host name. |
+ | `--disable-ipv6` | flag | `false` | Do not use IPv6. |
+diff --git a/src/http/NoProxy.cc b/src/http/NoProxy.cc
+new file mode 100644
+index 000000000..0f4abd22b
+--- /dev/null
++++ b/src/http/NoProxy.cc
+@@ -0,0 +1,105 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++// Which hosts reach the network directly while a proxy is configured:
++// --no-proxy and --no-proxy-list.
++#include "http/NoProxy.h"
++
++#include "base/Text.h"
++
++#include <algorithm>
++#include <regex>
++#include <utility>
++
++namespace aria2::http {
++namespace {
++
++// libcurl matches a bare domain against the host and every name below it, but
++// reads a *.glob literally, so a glob is resolved here.
++std::string globPattern(std::string_view glob)
++{
++  std::string pattern;
++  for (const char c : glob) {
++    if (c == '*') {
++      pattern += ".*";
++      continue;
++    }
++    if (std::string_view(".^$|()[]{}+?\\").find(c) != std::string_view::npos) {
++      pattern += '\\';
++    }
++    pattern += c;
++  }
++  return pattern;
++}
++
++void append(std::vector<std::string>& rules, std::string rule)
++{
++  if (rule.empty() ||
++      std::find(rules.begin(), rules.end(), rule) != rules.end()) {
++    return;
++  }
++  rules.push_back(std::move(rule));
++}
++
++} // namespace
++
++std::string normalizeNoProxyDomain(std::string_view entry)
++{
++  auto domain = text::lower(text::trim(entry));
++  for (const std::string_view wildcard : {"*.", "."}) {
++    if (domain.starts_with(wildcard)) {
++      domain.erase(0, wildcard.size());
++      break;
++    }
++  }
++  while (domain.ends_with('.')) {
++    domain.pop_back();
++  }
++  // A path, a URL or a glob anywhere but the front names no host.
++  if (domain.empty() || domain == "." || domain == ".." ||
++      domain.find_first_of("/* \t") != std::string::npos) {
++    return {};
++  }
++  return domain;
++}
++
++std::vector<std::string> parseNoProxyList(std::string_view spec)
++{
++  std::vector<std::string> domains;
++  const auto separated = text::replaceAll(
++      text::replaceAll(std::string(spec), ";", ","), "\n", ",");
++  for (const auto& entry : text::split(separated, ',')) {
++    append(domains, normalizeNoProxyDomain(entry));
++  }
++  return domains;
++}
++
++std::string noProxyRules(std::string_view noProxy, std::string_view list,
++                         std::string_view host)
++{
++  std::vector<std::string> rules;
++  const auto separated =
++      text::replaceAll(std::string(noProxy), ";", ",");
++  for (const auto& entry : text::split(separated, ',')) {
++    const auto rule = text::trim(entry);
++    if (rule == "*") {
++      // No host uses the proxy, so no further rule can change the answer.
++      return "*";
++    }
++    if (rule.find('*') == std::string_view::npos) {
++      append(rules, std::string(rule));
++      continue;
++    }
++    // A glob in --no-proxy has always named this request's host or nothing.
++    if (host.empty() || !std::regex_match(std::string(host),
++                                          std::regex(globPattern(rule),
++                                                     std::regex::icase))) {
++      continue;
++    }
++    append(rules, std::string(host));
++  }
++  for (auto& domain : parseNoProxyList(list)) {
++    append(rules, std::move(domain));
++  }
++  return text::join(rules, ",");
++}
++
++} // namespace aria2::http
+diff --git a/src/http/NoProxy.h b/src/http/NoProxy.h
+new file mode 100644
+index 000000000..813b5f537
+--- /dev/null
++++ b/src/http/NoProxy.h
+@@ -0,0 +1,28 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace aria2::http {
++
++// One --no-proxy-list entry in the form libcurl matches it: lower case and
++// without a leading "." or "*." wildcard, which already means the domain and
++// everything below it. Empty when the entry cannot name a host.
++std::string normalizeNoProxyDomain(std::string_view entry);
++
++// The domains of a --no-proxy-list value, separated by commas, semicolons or
++// line breaks, in the order given and without repeats. An entry that cannot
++// name a host (empty, a URL, a glob that is not a *.domain prefix) is dropped.
++std::vector<std::string> parseNoProxyList(std::string_view spec);
++
++// The value for CURLOPT_NOPROXY: --no-proxy followed by --no-proxy-list, so a
++// host named in either one reaches the network without the proxy. `*` in
++// --no-proxy keeps meaning "no host uses the proxy" and wins over everything
++// else. A *.glob in --no-proxy applies to `host` alone, as aria2 always did,
++// so it is replaced by `host` when it matches and dropped when it does not.
++std::string noProxyRules(std::string_view noProxy, std::string_view list,
++                         std::string_view host);
++
++} // namespace aria2::http
+diff --git a/src/http/Request.cc b/src/http/Request.cc
+index 48f01658f..e66054310 100644
+--- a/src/http/Request.cc
++++ b/src/http/Request.cc
+@@ -5,45 +5,14 @@
+ #include "base/Uri.h"
+ #include "http/Client.h"
+ #include "http/Cookies.h"
++#include "http/NoProxy.h"
+ #include "http/Request.h"
+ #include "http/SegmentPlanner.h"
+ #include "options/Options.h"
+ 
+-#include <regex>
+-
+ namespace aria2::http {
+ namespace {
+ 
+-// Expands host globs such as *.example.com for this request; libcurl keeps
+-// native domain, address and CIDR matching for the remaining rules.
+-std::string noProxyFor(const std::string& rules, const std::string& host)
+-{
+-  std::vector<std::string> result;
+-  for (auto rule : text::split(text::replaceAll(rules, ";", ","), ',')) {
+-    if (rule != "*" && rule.find('*') != std::string::npos) {
+-      std::string pattern;
+-      for (const char c : rule) {
+-        if (c == '*') {
+-          pattern += ".*";
+-          continue;
+-        }
+-        if (std::string_view(".^$|()[]{}+?\\").find(c) !=
+-            std::string_view::npos) {
+-          pattern += '\\';
+-        }
+-        pattern += c;
+-      }
+-      rule = std::regex_match(host, std::regex(pattern, std::regex::icase))
+-                 ? host
+-                 : "";
+-    }
+-    if (!rule.empty()) {
+-      result.push_back(rule);
+-    }
+-  }
+-  return text::join(result, ",");
+-}
+-
+ const char* proxyKind(const std::string& scheme)
+ {
+   return scheme == "https" ? "https" : scheme == "http" ? "http" : "all";
+@@ -186,8 +155,13 @@ void configureRequest(CURL* easy, CURLSH* share, std::string& loadedCookies,
+       set(CURLOPT_PROXYUSERNAME, options.get(prefix + "-user").c_str());
+       set(CURLOPT_PROXYPASSWORD, options.get(prefix + "-passwd").c_str());
+     }
+-    if (!options.blank("no-proxy") && parts) {
+-      const auto bypass = noProxyFor(options.get("no-proxy"), parts->host);
++    // A host on --no-proxy-list reaches the network directly, so a domain that
++    // is faster without the proxy can be named without disabling it.
++    const auto bypass = noProxyRules(options.get("no-proxy"),
++                                     options.get("no-proxy-list"),
++                                     parts ? std::string_view(parts->host)
++                                           : std::string_view());
++    if (!bypass.empty()) {
+       set(CURLOPT_NOPROXY, bypass.c_str());
+     }
+   }
+diff --git a/src/options/Catalog.cc b/src/options/Catalog.cc
+index 146ce00e7..ac2ba0477 100644
+--- a/src/options/Catalog.cc
++++ b/src/options/Catalog.cc
+@@ -66,6 +66,7 @@ constexpr std::array catalog{
+   OptionSpec{"https-proxy-user", 0, Text, "", TG | Secret, "http", "User for --https-proxy."},
+   OptionSpec{"https-proxy-passwd", 0, Text, "", TG | Secret, "http", "Password for --https-proxy."},
+   OptionSpec{"no-proxy", 0, Text, "", TG, "http", "Comma-separated hosts, domains, networks or *.globs that bypass the proxy."},
++  OptionSpec{"no-proxy-list", 0, List, "", TG, "http", "Domains fetched directly even when a proxy is set, on top of --no-proxy: nvidia.com, *.amd.com; repeatable."},
+   OptionSpec{"dns-over-https", 0, Text, "", TG, "http", "Resolve host names through this DNS-over-HTTPS URL."},
+   OptionSpec{"interface", 0, Text, "", TG, "http", "Bind connections to an interface, IP address or host name."},
+   OptionSpec{"disable-ipv6", 0, Flag, "false", TG, "http", "Do not use IPv6."},
+diff --git a/tests/NoProxyTest.cc b/tests/NoProxyTest.cc
+new file mode 100644
+index 000000000..4b3d9d6d4
+--- /dev/null
++++ b/tests/NoProxyTest.cc
+@@ -0,0 +1,75 @@
++/* Copyright (C) 2026 aria2-next contributors. GPL-2.0-or-later. */
++#include "http/NoProxy.h"
++
++#include <doctest/doctest.h>
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++using namespace aria2;
++using namespace std::string_view_literals;
++
++TEST_CASE("no-proxy list entries become bare domains")
++{
++  const auto domains = http::parseNoProxyList("nvidia.com,*.AMD.com; .intel.cn ");
++  REQUIRE(domains.size() == 3);
++  CHECK(domains[0] == "nvidia.com");
++  // The *.domain form already means the domain and its subdomains.
++  CHECK(domains[1] == "amd.com");
++  CHECK(domains[2] == "intel.cn");
++  // Repeats and different separators name the same host once.
++  CHECK(http::parseNoProxyList("amd.com\nAMD.COM,amd.com"sv) ==
++        std::vector<std::string>{"amd.com"});
++  // A configuration file arrives as one value per line.
++  CHECK(http::parseNoProxyList("a.example\nb.example") ==
++        std::vector<std::string>{"a.example", "b.example"});
++}
++
++TEST_CASE("no-proxy list entries that name no host are dropped")
++{
++  CHECK(http::parseNoProxyList("").empty());
++  CHECK(http::parseNoProxyList(" , ; \n ").empty());
++  // A path, a URL and a glob that is not a *.domain prefix are not hosts.
++  CHECK(http::parseNoProxyList("https://example.com/file").empty());
++  CHECK(http::parseNoProxyList("example.com/download").empty());
++  CHECK(http::parseNoProxyList("exa*mple.com").empty());
++  CHECK(http::parseNoProxyList("*").empty());
++}
++
++TEST_CASE("no-proxy list adds to --no-proxy in the order given")
++{
++  CHECK(http::noProxyRules("localhost, 10.0.0.0/8", "nvidia.com,amd.com",
++                           "cdn.example.com") ==
++        "localhost,10.0.0.0/8,nvidia.com,amd.com");
++  // A host named twice is bypassed once.
++  CHECK(http::noProxyRules("nvidia.com", "NVIDIA.com,amd.com",
++                           "cdn.example.com") == "nvidia.com,amd.com");
++}
++
++TEST_CASE("an empty no-proxy list leaves --no-proxy alone")
++{
++  // The list is empty by default, so a configuration without it keeps the
++  // rules it always had, and no rules still means no bypass.
++  CHECK(http::noProxyRules("localhost", "", "example.com") == "localhost");
++  CHECK(http::noProxyRules("", "", "example.com").empty());
++}
++
++TEST_CASE("no-proxy * keeps meaning that no host uses the proxy")
++{
++  CHECK(http::noProxyRules("*", "nvidia.com", "example.com") == "*");
++  CHECK(http::noProxyRules("localhost;*", "", "example.com") == "*");
++}
++
++TEST_CASE("no-proxy globs apply to the request host only")
++{
++  const auto matching =
++      http::noProxyRules("*.corp.example", "", "a.corp.example");
++  CHECK(matching == "a.corp.example");
++  // libcurl would read the glob literally and never match, so it is dropped.
++  const auto other =
++      http::noProxyRules("*.corp.example", "", "corp.example.net");
++  CHECK(other.empty());
++  // An empty host cannot satisfy a glob.
++  CHECK(http::noProxyRules("*.corp.example", "", "").empty());
++}
+-- 
+2.47.3
+
