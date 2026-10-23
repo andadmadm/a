@@ -3,9 +3,7 @@ name: Build aria2-next Release
 on:
   push:
     paths:
-      - "aria2-next/更新时间.txt"
-      - "aria2-next/patch/aria2-next.patch"
-      - ".github/workflows/build-release.yml"
+      - "aria2-next/*"
   workflow_dispatch:
 
 permissions:
