@@ -22,6 +22,7 @@ jobs:
     outputs:
       tag: ${{ steps.upstream.outputs.tag }}
       version: ${{ steps.upstream.outputs.version }}
+      build_timestamp: ${{ steps.upstream.outputs.build_timestamp }}
     steps:
       - name: Get latest upstream release
         id: upstream
@@ -37,9 +38,12 @@ jobs:
             exit 1
           fi
           version="${tag#v}"
+          build_timestamp="$(date -u +%Y%m%d-%H%M%S)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build_timestamp=$build_timestamp" >> "$GITHUB_OUTPUT"
           echo "Upstream release: $tag"
+          echo "Build timestamp: $build_timestamp (UTC)"
 
   build-linux:
     name: Build Linux x86_64
@@ -132,7 +136,7 @@ jobs:
       TARGET_PROCESSOR: x86_64
       RUNTIME_PLATFORM: windows-x86_64
       WINDOWS_DEBUG_MAP_FLAGS: ""
-      ARIA2_RELEASE_LTO: OFF
+      ARIA2_RELEASE_LTO: "OFF"
     steps:
       - name: Checkout workflow and patches
         uses: actions/checkout@v4
@@ -177,3 +181,103 @@ jobs:
           echo "$PWD/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Configure toolchain
+        shell: bash
+        run: |
+          prefix=x86_64-w64-mingw32
+          {
+            echo "CC=${prefix}-clang"
+            echo "CXX=${prefix}-clang++"
+            echo "RC=${prefix}-windres"
+            echo "AR=${prefix}-ar"
+            echo "RANLIB=${prefix}-ranlib"
+            echo "STRIP=${prefix}-strip"
+            echo "OBJDUMP=${prefix}-objdump"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify runner tools
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/scripts/verify-runner-tools windows-x86_64
+
+      - name: Build release
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/scripts/build-release windows
+
+      - name: Package binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          BINARY="source/build/release/aria2-next.exe"
+          if [[ ! -f "$BINARY" ]]; then
+            echo "::error::Build output not found: $BINARY"
+            find source/build -maxdepth 4 -type f -print || true
+            exit 1
+          fi
+          mkdir -p release-files
+          PACKAGE="aria2-next-${VERSION}-windows-x86_64.exe"
+          install -m 0755 "$BINARY" "release-files/$PACKAGE"
+          ls -lh release-files/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: release-files/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - resolve-upstream
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-files
+          find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          echo "Release files:"
+          ls -lh
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: aria2-next-${{ needs.resolve-upstream.outputs.version }}-${{ needs.resolve-upstream.outputs.build_timestamp }}
+          name: aria2-next ${{ needs.resolve-upstream.outputs.tag }} (patched, ${{ needs.resolve-upstream.outputs.build_timestamp }})
+          body: |
+            Linux x86_64 and Windows x86_64 builds of AnInsomniacy/aria2-next.
+
+            Upstream release: ${{ needs.resolve-upstream.outputs.tag }}
+            Build timestamp: ${{ needs.resolve-upstream.outputs.build_timestamp }} (UTC)
+
+            This build applies the unified patch:
+            `aria2-next/patch/aria2-next.patch`
+
+            The patch includes:
+            - `--category-dir`
+            - `--category-dir-scope`
+            - `--no-proxy-list`
+
+            Verify the downloaded binaries using SHA256SUMS.txt.
+          files: |
+            release-files/*
+          fail_on_unmatched_files: true
+          make_latest: false
