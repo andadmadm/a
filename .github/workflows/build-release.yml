@@ -1,0 +1,175 @@
+name: Build Patched aria2-next
+
+on:
+  push:
+    paths:
+      - "aria2-next/更新时间.txt"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aria2-next-build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout configuration repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream Release
+        id: upstream
+        run: |
+          set -euo pipefail
+
+          RELEASE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/AnInsomniacy/aria2-next/releases/latest)
+
+          TAG=$(jq -er '.tag_name' <<< "$RELEASE")
+          UPDATED_AT=$(jq -er '.updated_at' <<< "$RELEASE")
+          LOCAL_TIME=$(tr -d '\r\n' < aria2-next/更新时间.txt)
+
+          if [ "$LOCAL_TIME" != "$UPDATED_AT" ]; then
+            echo "更新时间文件与上游最新 Release 不一致"
+            echo "请重新运行检查任务后再编译"
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+
+          if ! printf '%s\n' "$VERSION" |
+            grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "不支持的 Release 标签：$TAG"
+            exit 1
+          fi
+
+          RELEASE_TIME=$(date -u -d "$UPDATED_AT" +'%Y%m%dT%H%M%SZ')
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "time=$RELEASE_TIME"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "上游标签：$TAG"
+          echo "版本：$VERSION"
+          echo "更新时间：$UPDATED_AT"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            jq \
+            perl \
+            python3 \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            ca-certificates
+
+      - name: Clone upstream source
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --depth 1 \
+            --branch "$UPSTREAM_TAG" \
+            https://github.com/AnInsomniacy/aria2-next.git \
+            source
+
+      - name: Copy patches
+        run: |
+          set -euo pipefail
+
+          cp aria2-next/patch/aria2-next-no-proxy-list.patch \
+            source/
+
+          cp aria2-next/patch/aria2-next-category-dir.patch \
+            source/
+
+      - name: Apply patches
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          git apply --check aria2-next-no-proxy-list.patch
+          git apply aria2-next-no-proxy-list.patch
+
+          git apply --check aria2-next-category-dir.patch
+          git apply aria2-next-category-dir.patch
+
+          echo "两个补丁均已应用"
+
+      - name: Verify runner tools
+        working-directory: source
+        run: |
+          packaging/scripts/verify-runner-tools linux
+
+      - name: Build release binary
+        working-directory: source
+        env:
+          ARIA2_BUILD_PROFILE: release
+          CMAKE_BUILD_TYPE: Release
+          STRIP_BINARY: "true"
+          TARGET_PROCESSOR: x86_64
+        run: |
+          packaging/scripts/build-release linux
+
+      - name: Package and verify binary
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          BINARY="source/build/release/aria2-next"
+          test -f "$BINARY"
+          test -x "$BINARY"
+
+          "$BINARY" --version
+
+          mkdir -p release-files
+
+          ASSET="aria2-next-${VERSION}-linux-x86_64"
+          cp "$BINARY" "release-files/$ASSET"
+
+          cd release-files
+          sha256sum "$ASSET" > "aria2-next-${VERSION}-checksums.sha256"
+
+      - name: Publish patched Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "patched-${{ steps.upstream.outputs.tag }}-${{ steps.upstream.outputs.time }}"
+          name: "aria2-next ${{ steps.upstream.outputs.version }} (patched)"
+          body: |
+            Custom build of AnInsomniacy/aria2-next.
+
+            Upstream release: ${{ steps.upstream.outputs.tag }}
+
+            Applied patches:
+            - aria2-next-no-proxy-list.patch
+            - aria2-next-category-dir.patch
+
+            Target: Linux x86_64
+
+            Source:
+            https://github.com/AnInsomniacy/aria2-next
+          files: |
+            release-files/aria2-next-*-linux-x86_64
+            release-files/aria2-next-*-checksums.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
