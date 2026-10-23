@@ -1,4 +1,3 @@
-```yaml
 name: Check aria2-next Update
 
 on:
@@ -76,4 +75,3 @@ jobs:
 
           git commit -m "Update aria2-next release timestamp"
           git push
-```
