@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
 
       - name: Check latest upstream Release
         id: check
@@ -43,7 +45,7 @@ jobs:
           mkdir -p aria2-next
           touch "$FILE"
 
-          OLD_TIME=$(tr -d '\r\n' < "$FILE")
+          OLD_TIME=$(cat "$FILE" | tr -d '\r\n')
 
           echo "上游标签：$TAG"
           echo "上游更新时间：$UPDATED_AT"
