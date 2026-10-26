@@ -260,8 +260,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: aria2-next-${{ needs.resolve-upstream.outputs.version }}-${{ needs.resolve-upstream.outputs.build_timestamp }}
-          name: aria2-next ${{ needs.resolve-upstream.outputs.tag }} (patched, ${{ needs.resolve-upstream.outputs.build_timestamp }})
+          tag_name: ${{ needs.resolve-upstream.outputs.version }}-${{ needs.resolve-upstream.outputs.build_timestamp }}
+          name: ${{ needs.resolve-upstream.outputs.tag }} (patched, ${{ needs.resolve-upstream.outputs.build_timestamp }})
           body: |
             Linux x86_64 and Windows x86_64 builds of AnInsomniacy/aria2-next.
 
