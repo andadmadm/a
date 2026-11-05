@@ -115,7 +115,7 @@ jobs:
             exit 1
           fi
           mkdir -p release-files
-          PACKAGE="ariac-linux-x86_64"
+          PACKAGE="aria2c-linux-x86_64"
           install -m 0755 "$BINARY" "release-files/$PACKAGE"
           ls -lh release-files/
 
@@ -221,7 +221,7 @@ jobs:
             exit 1
           fi
           mkdir -p release-files
-          PACKAGE="ariac.exe"
+          PACKAGE="aria2c.exe"
           install -m 0755 "$BINARY" "release-files/$PACKAGE"
           ls -lh release-files/
 
